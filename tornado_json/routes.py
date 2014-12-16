@@ -4,9 +4,14 @@ import importlib
 import inspect
 from itertools import chain
 from functools import reduce
+from functools import partial
+from collections import namedtuple
 
 from tornado_json.constants import HTTP_METHODS, basestring
 from tornado_json.utils import extract_method, is_method, is_handler_subclass
+
+
+AutoURL = namedtuple('AutoURL', ['type'])
 
 
 def get_routes(package):
@@ -88,8 +93,22 @@ def get_module_routes(module_name, custom_routes=None, exclusions=None):
         method = extract_method(wrapped_method)
         return [a for a in inspect.getargspec(method).args if a not in ["self"]]
 
-    def generate_auto_route(module, module_name, cls_name, method_name, url_name):
-        """Generate URL for auto_route
+    def generate_auto_routes(module, module_name, cls_name, method_name):
+        """Generate auto routes based on handler attributes
+
+        :rtype: generator
+        :returns: Generator that yields automatic routes
+        """
+        handler = getattr(module, cls_name)
+        gen_route = partial(generate_route, module, module_name, cls_name,
+                            method_name)
+        if handler._tj_no_auto_route is False:
+            yield gen_route(url_name=AutoURL('self'))
+        if handler._tj_route_base is True:
+            yield gen_route(url_name=AutoURL('module'))
+
+    def generate_route(module, module_name, cls_name, method_name, url_name):
+        """Generate URL for current context given ``url_name``
 
         :rtype: str
         :returns: Constructed URL based on given arguments
@@ -97,18 +116,26 @@ def get_module_routes(module_name, custom_routes=None, exclusions=None):
         def get_handler_name():
             """Get handler identifier for URL
 
-            For the special case where ``url_name`` is
-            ``__self__``, the handler is named a lowercase
+            For the special case where ``url_name`` is:
+
+            * ``AutoURL("self")``, the handler is named a lowercase
             value of its own name with 'handler' removed
-            from the ending if give; otherwise, we
-            simply use the provided ``url_name``
+            from the ending if given
+            * ``AutoURL("module")``, return ``""``
+
+            ...otherwise, we simply use the provided ``url_name``
             """
-            if url_name == "__self__":
+            if url_name == AutoURL('self'):
                 if cls_name.lower().endswith('handler'):
-                    return cls_name.lower().replace('handler', '', 1)
-                return cls_name.lower()
+                    res = cls_name.lower().replace('handler', '', 1)
+                else:
+                    res = cls_name.lower()
+            elif url_name == AutoURL('module'):
+                res = None
             else:
-                return url_name
+                res = url_name
+
+            return "/{}".format(res) if res is not None else ""
 
         def get_arg_route():
             """Get remainder of URL determined by method argspec
@@ -125,8 +152,12 @@ def get_module_routes(module_name, custom_routes=None, exclusions=None):
                 ))
             return r"/?"
 
-        return "/{}/{}{}".format(
-            "/".join(module_name.split(".")[1:]),
+        def get_module_path():
+            """Get module path joined together with ``"/"``"""
+            return "/{path}".format(path="/".join(module_name.split(".")[1:]))
+
+        return "{}{}{}".format(
+            get_module_path(),
             get_handler_name(),
             get_arg_route()
         )
@@ -148,24 +179,27 @@ def get_module_routes(module_name, custom_routes=None, exclusions=None):
     # You better believe this is a list comprehension
     auto_routes = list(chain(*[
         list(set(chain(*[
-            # Generate a route for each "name" specified in the
-            #   __url_names__ attribute of the handler
+            # Generate a route for each "end_pattern" specified in the
+            # by the decorator this requesthandler
             [
                 # URL, requesthandler tuple
                 (
-                    generate_auto_route(
+                    generate_route(
                         module, module_name, cls_name, method_name, url_name
                     ),
                     getattr(module, cls_name)
-                ) for url_name in getattr(module, cls_name).__url_names__
-                # Add routes for each custom URL specified in the
-                #   __urls__ attribute of the handler
+                ) for url_name in getattr(module, cls_name)._tj_end_pattern
+            # Add routes for each custom URL specified as a "pattern"
+            # by the ``route`` decorator if one decorates this requesthandler
             ] + [
                 (
                     url,
                     getattr(module, cls_name)
-                ) for url in getattr(module, cls_name).__urls__
-            ]
+                ) for url in getattr(module, cls_name)._tj_pattern
+            # Generate auto routes as set by other attributes from
+            # the ``route`` decorator
+            ] + list(generate_auto_routes(module, module_name,
+                                          cls_name, method_name))
             # We create a route for each HTTP method in the handler
             #   so that we catch all possible routes if different
             #   HTTP methods have different argspecs and are expecting
@@ -245,6 +279,16 @@ def route(pattern=None, end_pattern=None, no_auto_route=True):
                           the handler being decorated by this, is kept
                           along with the additional routes.
     """
+    def _sanitize_pattern(p):
+        p = p.strip("$")
+        if not p.endswith("/?"):
+            if p.endswith("/"):
+                p += "?"
+            else:
+                p += "/?"
+        p += "$"
+        return p
+
     def _transform_attr(attr):
         if isinstance(attr, basestring):
             return [attr]
@@ -257,8 +301,8 @@ def route(pattern=None, end_pattern=None, no_auto_route=True):
                             "or `list`)".format(type(attr).__name__, attr))
 
     def _route(handler):
-        handler._tj_title = _transform_attr(end_pattern)
-        handler._tj_pattern = _transform_attr(pattern)
+        handler._tj_end_pattern = _transform_attr(end_pattern)
+        handler._tj_pattern = map(_sanitize_pattern, _transform_attr(pattern))
         handler._tj_no_auto_route = no_auto_route
         return handler
     return _route
@@ -278,4 +322,5 @@ def baseroute(handler):
     to be automatically handled as expected by the routing system.
     """
     handler._tj_route_base = True
+    handler._tj_no_auto_route = True
     return handler
